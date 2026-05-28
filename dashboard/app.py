@@ -34,6 +34,25 @@ from config import (
     WEIGHTING_METHODS, BENCHMARK_LABEL,
 )
 
+# ─── Data source detection ───────────────────────────────────────────────────
+# When running on Streamlit Community Cloud there is no PostgreSQL.
+# If the data/ folder with exported Parquet files exists, use that instead.
+
+_DATA_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "data")
+_MANIFEST_PATH = os.path.join(_DATA_DIR, "manifest.json")
+
+def _file_mode() -> bool:
+    """Return True if we should read from data/ files instead of PostgreSQL."""
+    return os.path.exists(_MANIFEST_PATH)
+
+def _get_manifest() -> dict:
+    """Load the export manifest (contains export date, ticker list, etc.)."""
+    if not os.path.exists(_MANIFEST_PATH):
+        return {}
+    with open(_MANIFEST_PATH) as f:
+        return json.load(f)
+
+
 # ─── Page Config ─────────────────────────────────────────────────────────────
 st.set_page_config(
     page_title=DASHBOARD_TITLE,
@@ -739,11 +758,34 @@ def signal_badge(signal: str) -> str:
 
 @st.cache_data(ttl=3600)
 def load_market_data(tickers, years=3):
+    """Load price and return data. Uses data/ files on Streamlit Cloud, PostgreSQL locally."""
+    tickers = list(tickers)
+
+    # ── File mode (Streamlit Community Cloud) ─────────────────────────────────
+    if _file_mode():
+        close_path  = os.path.join(_DATA_DIR, "close_prices.parquet")
+        ret_path    = os.path.join(_DATA_DIR, "returns.parquet")
+        bench_path  = os.path.join(_DATA_DIR, "benchmark_returns.parquet")
+        try:
+            close_m   = pd.read_parquet(close_path)
+            returns_m = pd.read_parquet(ret_path)
+            bench_df  = pd.read_parquet(bench_path)
+            bench_r   = bench_df["benchmark_return"].squeeze()
+            # Filter to requested tickers that exist in the files
+            avail_t   = [t for t in tickers if t in close_m.columns]
+            close_m   = close_m[avail_t]
+            returns_m = returns_m[[t for t in avail_t if t in returns_m.columns]]
+            bench_r.index = pd.to_datetime(bench_r.index)
+            return close_m, returns_m, bench_r
+        except Exception as e:
+            st.warning(f"Could not read data files: {e}")
+            return pd.DataFrame(), pd.DataFrame(), pd.Series(dtype=float)
+
+    # ── Database mode (local development) ─────────────────────────────────────
     from data_engine.market_data import (
         run_market_data_pipeline, load_close_matrix,
         load_returns_matrix, fetch_benchmark, compute_returns,
     )
-    tickers = list(tickers)
     try:
         close_m   = load_close_matrix(tickers)
         returns_m = load_returns_matrix(tickers)
@@ -770,16 +812,47 @@ def load_market_data(tickers, years=3):
 
 @st.cache_data(ttl=86400)
 def load_fundamentals_data(tickers):
+    """Load fundamentals. Uses data/ files on Streamlit Cloud, PostgreSQL locally."""
+    if _file_mode():
+        path = os.path.join(_DATA_DIR, "fundamentals.parquet")
+        try:
+            df = pd.read_parquet(path)
+            return df[df["ticker"].isin(tickers)] if "ticker" in df.columns else df
+        except Exception:
+            return pd.DataFrame()
     from data_engine.fundamentals import run_fundamentals_pipeline
     return run_fundamentals_pipeline(tickers)
+
+
+@st.cache_data(ttl=86400)
+def load_precomputed_signals(tickers):
+    """Load pre-computed ML signals from data/ files (file mode only)."""
+    if not _file_mode():
+        return pd.DataFrame()
+    path = os.path.join(_DATA_DIR, "signals.parquet")
+    try:
+        df = pd.read_parquet(path)
+        return df[df["ticker"].isin(tickers)] if "ticker" in df.columns else df
+    except Exception:
+        return pd.DataFrame()
+
+
+@st.cache_data(ttl=86400)
+def load_precomputed_factors(tickers):
+    """Load pre-computed factor scores from data/ files (file mode only)."""
+    if not _file_mode():
+        return pd.DataFrame()
+    path = os.path.join(_DATA_DIR, "factors.parquet")
+    try:
+        df = pd.read_parquet(path)
+        return df[df["ticker"].isin(tickers)] if "ticker" in df.columns else df
+    except Exception:
+        return pd.DataFrame()
 
 
 @st.cache_data(ttl=1800)
 def run_full_analysis(tickers, weighting_method, custom_weights_json=None):
     from analytics.portfolio import compute_weights, portfolio_summary
-    from factors.composite   import run_factor_pipeline
-    from ml_engine.models    import run_ml_pipeline
-    from data_engine.events  import run_events_pipeline
 
     close_m, returns_m, bench_r = load_market_data(tickers)
     fundamentals_df = load_fundamentals_data(tickers)
@@ -794,12 +867,45 @@ def run_full_analysis(tickers, weighting_method, custom_weights_json=None):
     custom_w = custom_weights_json or {}
     weights  = compute_weights(tickers, weighting_method, market_caps, custom_w)
     summary  = portfolio_summary(tickers, weights, returns_m, bench_r, weighting_method)
+
+    # ── In file mode: use pre-computed factors and signals ───────────────────
+    if _file_mode():
+        factor_df  = load_precomputed_factors(tickers)
+        signals_df = load_precomputed_signals(tickers)
+        shap_df    = None
+        sentiment_df = pd.DataFrame()
+        no_news_key  = True
+
+        # Load events if available
+        events_path = os.path.join(_DATA_DIR, "events.parquet")
+        if os.path.exists(events_path):
+            try:
+                from data_engine.events import compute_ticker_sentiment_summary
+                events_df    = pd.read_parquet(events_path)
+                sentiment_df = compute_ticker_sentiment_summary(events_df)
+            except Exception:
+                pass
+
+        return {
+            "close_m":      close_m,   "returns_m":    returns_m,
+            "bench_r":      bench_r,   "fundamentals": fundamentals_df,
+            "weights":      weights,   "summary":      summary,
+            "factor_df":    factor_df, "sentiment_df": sentiment_df,
+            "no_news_key":  no_news_key,
+            "signals_df":   signals_df, "shap_df":     shap_df,
+        }
+
+    # ── In database mode: compute everything live ────────────────────────────
+    from factors.composite  import run_factor_pipeline
+    from ml_engine.models   import run_ml_pipeline
+    from data_engine.events import run_events_pipeline
+
     factor_df = run_factor_pipeline(tickers, close_m, returns_m, fundamentals_df, bench_r)
 
     sentiment_df = pd.DataFrame()
     no_news_key  = False
     try:
-        news_key = os.getenv("NEWS_API_KEY", "") if (os := __import__("os")) else ""
+        news_key = os.getenv("NEWS_API_KEY", "")
         if news_key and news_key != "your_newsapi_key_here":
             sentiment_df = run_events_pipeline(tickers, days_back=7)
         else:
@@ -812,12 +918,12 @@ def run_full_analysis(tickers, weighting_method, custom_weights_json=None):
     )
 
     return {
-        "close_m":      close_m,   "returns_m":  returns_m,
+        "close_m":      close_m,   "returns_m":    returns_m,
         "bench_r":      bench_r,   "fundamentals": fundamentals_df,
-        "weights":      weights,   "summary":    summary,
+        "weights":      weights,   "summary":      summary,
         "factor_df":    factor_df, "sentiment_df": sentiment_df,
         "no_news_key":  no_news_key,
-        "signals_df":   signals_df, "shap_df":   shap_df,
+        "signals_df":   signals_df, "shap_df":     shap_df,
     }
 
 
@@ -1902,13 +2008,20 @@ def render_optimization(data: Dict):
 
         # ── Show comparison table ────────────────────────────────────────────
         if st.session_state.get("opt_compare") is not None:
-            comp_df = st.session_state["opt_compare"]
+            comp_raw = st.session_state["opt_compare"]
+            # _compare_all_methods returns a list of dicts — convert to DataFrame
+            comp_df = pd.DataFrame(comp_raw) if isinstance(comp_raw, list) else comp_raw
             st.markdown("#### All Methods Comparison")
-            st.dataframe(comp_df.style.highlight_max(
-                subset=["Sharpe Ratio"], color="#1D3A1D"
-            ).highlight_min(
-                subset=["Ann. Volatility"], color="#1D2A3A"
-            ), width="stretch", hide_index=True)
+            try:
+                styled = comp_df.style.highlight_max(
+                    subset=["Sharpe Ratio"], color="#1D3A1D"
+                ).highlight_min(
+                    subset=["Ann. Volatility"], color="#1D2A3A"
+                )
+                st.dataframe(styled, width="stretch", hide_index=True)
+            except Exception:
+                # Fallback: plain table if styling fails (e.g. non-numeric columns)
+                st.dataframe(comp_df, width="stretch", hide_index=True)
 
         # ── Show single method result ────────────────────────────────────────
         elif st.session_state.get("opt_result") is not None:
@@ -1976,60 +2089,66 @@ def render_optimization(data: Dict):
         else:
             ef = st.session_state.get("ef_result")
 
-        if ef:
-            rand_df   = ef["random"]
-            frontier  = ef["frontier"]
-            min_var   = ef["min_var"]
-            max_sharpe = ef["max_sharpe"]
+        if ef is not None:
+            rand_df    = ef.get("random_portfolios", pd.DataFrame())
+            frontier   = ef.get("frontier_points",  pd.DataFrame())
+            min_vol_r  = ef.get("min_vol",    {}) or {}
+            max_sharpe = ef.get("max_sharpe", {}) or {}
 
             # Current portfolio point
-            from analytics.portfolio_optimizer import expected_returns_historical, portfolio_performance
+            from analytics.portfolio_optimizer import (
+                expected_returns_historical, portfolio_performance
+            )
             from backtesting.stress_testing import compute_covariance_matrix
             cur_tickers = [t for t in tickers if t in returns_m.columns]
-            mu   = expected_returns_historical(returns_m[cur_tickers], window).values
+            mu_s    = expected_returns_historical(returns_m[cur_tickers], window)
+            mu_arr  = mu_s.values
             cov_ann, _ = compute_covariance_matrix(returns_m[cur_tickers], window)
-            w_cur = np.array([weights.get(t, 1/len(cur_tickers)) for t in cur_tickers])
-            w_cur /= w_cur.sum()
-            cur_r, cur_v, cur_s = portfolio_performance(w_cur, mu, cov_ann.values)
+            w_cur   = np.array([weights.get(t, 1/len(cur_tickers)) for t in cur_tickers])
+            w_cur  /= w_cur.sum()
+            cur_r, cur_v, cur_s = portfolio_performance(w_cur, mu_arr, cov_ann.values)
 
             fig = go.Figure()
 
             # Random portfolios (coloured by Sharpe)
-            fig.add_trace(go.Scatter(
-                x=rand_df["volatility"] * 100,
-                y=rand_df["return"] * 100,
-                mode="markers",
-                marker=dict(
-                    color=rand_df["sharpe"],
-                    colorscale="Viridis",
-                    size=3, opacity=0.4,
-                    colorbar=dict(title=dict(text="Sharpe", font=dict(color="#90A4AE")),
-                                   tickfont=dict(color="#90A4AE")),
-                ),
-                name="Random portfolios",
-                hovertemplate="Vol: %{x:.2f}%<br>Return: %{y:.2f}%<extra></extra>",
-            ))
-
-            # Frontier curve
-            if frontier:
-                f_vols = [p["vol"]*100 for p in frontier]
-                f_rets = [p["ret"]*100 for p in frontier]
+            if not rand_df.empty and "volatility" in rand_df.columns:
                 fig.add_trace(go.Scatter(
-                    x=f_vols, y=f_rets,
+                    x=rand_df["volatility"] * 100,
+                    y=rand_df["return"] * 100,
+                    mode="markers",
+                    marker=dict(
+                        color=rand_df["sharpe"],
+                        colorscale="Viridis",
+                        size=3, opacity=0.4,
+                        colorbar=dict(
+                            title=dict(text="Sharpe", font=dict(color="#90A4AE")),
+                            tickfont=dict(color="#90A4AE"),
+                        ),
+                    ),
+                    name="Random portfolios",
+                    hovertemplate="Vol: %{x:.2f}%<br>Return: %{y:.2f}%<extra></extra>",
+                ))
+
+            # Frontier curve — columns are "volatility", "return", "sharpe"
+            if frontier is not None and not frontier.empty and "volatility" in frontier.columns:
+                fig.add_trace(go.Scatter(
+                    x=frontier["volatility"] * 100,
+                    y=frontier["return"] * 100,
                     mode="lines", line=dict(color=BRAND_COLOR, width=2.5),
                     name="Efficient Frontier",
                 ))
 
-            # Key portfolios
+            # Key portfolios — use expected_return / expected_vol keys from optimizer
             for label, res, color, sym in [
-                ("Min Variance",  min_var,    SUCCESS_COLOR, "diamond"),
-                ("Max Sharpe",    max_sharpe, ACCENT_COLOR,  "star"),
-                ("Current",       {"ann_vol": cur_v, "ann_return": cur_r}, NEUTRAL_COLOR, "circle"),
+                ("Min Variance", min_vol_r,  SUCCESS_COLOR, "diamond"),
+                ("Max Sharpe",   max_sharpe, ACCENT_COLOR,  "star"),
+                ("Current",      {"expected_return": cur_r, "expected_vol": cur_v},
+                                             NEUTRAL_COLOR, "circle"),
             ]:
-                if res:
+                if res and isinstance(res, dict):
                     fig.add_trace(go.Scatter(
-                        x=[res.get("ann_vol",0)*100],
-                        y=[res.get("ann_return",0)*100],
+                        x=[res.get("expected_vol",    res.get("ann_vol",    0)) * 100],
+                        y=[res.get("expected_return", res.get("ann_return", 0)) * 100],
                         mode="markers+text",
                         marker=dict(color=color, size=14, symbol=sym,
                                     line=dict(color="white", width=1.5)),
@@ -2690,11 +2809,26 @@ def render_glossary():
 # ─── Main App ─────────────────────────────────────────────────────────────────
 
 def main():
+    manifest    = _get_manifest()
+    export_date = manifest.get("export_date", "")
+    n_tickers   = manifest.get("n_tickers", 0)
+    if _file_mode() and export_date:
+        badge = (
+            f'<span style="background:#0E2A1A;border:0.5px solid #1A5C30;border-radius:4px;'
+            f'padding:2px 10px;font-size:11px;color:#00C853;margin-left:12px;">'
+            f'📦 Pre-computed · {n_tickers} tickers · {export_date}</span>'
+        )
+    else:
+        badge = (
+            '<span style="background:#0E1A2E;border:0.5px solid #1E3A5C;border-radius:4px;'
+            'padding:2px 10px;font-size:11px;color:#00D4FF;margin-left:12px;">'
+            '🔴 Live database</span>'
+        )
     st.markdown(f"""
     <div style="border-bottom:1px solid #1E2A3A;padding-bottom:16px;margin-bottom:8px;">
         <h1 style="margin:0;font-size:28px;color:#E0E8F0;">📊 {DASHBOARD_TITLE}</h1>
         <p style="margin:4px 0 0 0;color:#00D4FF;font-size:13px;letter-spacing:1px;">
-            {DASHBOARD_SUBTITLE.upper()}
+            {DASHBOARD_SUBTITLE.upper()}{badge}
         </p>
     </div>
     """, unsafe_allow_html=True)

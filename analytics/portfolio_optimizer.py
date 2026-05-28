@@ -49,6 +49,8 @@ def build_price_matrix(tickers, returns_matrix):
 
 
 def compute_expected_returns(prices, frequency=TRADING_DAYS_YEAR):
+    # Drop columns that are all-NaN before computing — prevents dimension mismatches
+    prices = prices.dropna(axis=1, how="all")
     if PYPFOPT_AVAILABLE:
         try:
             return expected_returns.mean_historical_return(prices, frequency=frequency)
@@ -58,6 +60,10 @@ def compute_expected_returns(prices, frequency=TRADING_DAYS_YEAR):
 
 
 def compute_cov_matrix(prices, frequency=TRADING_DAYS_YEAR):
+    # Drop columns that are all-NaN or have zero variance
+    prices = prices.dropna(axis=1, how="all")
+    rets   = prices.pct_change().dropna()
+    prices = prices[rets.columns[rets.std() > 0]]   # remove zero-variance columns
     if PYPFOPT_AVAILABLE:
         try:
             return risk_models.CovarianceShrinkage(prices, frequency=frequency).ledoit_wolf()
@@ -81,6 +87,8 @@ def _scipy_max_sharpe(mu, S):
 
 
 def _scipy_min_vol(S, tickers):
+    # Filter tickers to those present in S after NaN/zero-var filtering
+    tickers = [t for t in tickers if t in S.columns]
     n = len(tickers)
     def vol(w): return float(np.sqrt(w @ S.values @ w))
     res = minimize(vol, np.ones(n)/n, method="SLSQP",
@@ -144,8 +152,16 @@ def optimize_min_volatility(tickers, prices):
 def optimize_risk_parity(tickers, prices):
     mu = compute_expected_returns(prices)
     S  = compute_cov_matrix(prices)
+    # Use only tickers that survived NaN/zero-var filtering inside S
+    valid_tickers = [t for t in tickers if t in S.columns]
+    mu = mu.reindex(valid_tickers).fillna(0)
+    S  = S.reindex(index=valid_tickers, columns=valid_tickers).fillna(0)
     Sv = S.values
-    n  = len(tickers)
+    n  = len(valid_tickers)          # ← derive from S, not from tickers
+    if n == 0:
+        return {"method":"risk_parity","weights":{},"expected_return":0,
+                "expected_vol":0,"sharpe_ratio":0,"success":False,
+                "error":"No valid tickers after filtering"}
     target = np.ones(n) / n
 
     def obj(w):
@@ -159,7 +175,7 @@ def optimize_risk_parity(tickers, prices):
                    constraints=[{"type":"eq","fun":lambda w: w.sum()-1}],
                    options={"maxiter":5000,"ftol":1e-12})
     w = res.x / res.x.sum()
-    weights = {t: float(w[i]) for i, t in enumerate(tickers)}
+    weights = {t: float(w[i]) for i, t in enumerate(valid_tickers)}
 
     pv = float(w @ Sv @ w)
     mrc = Sv @ w
@@ -167,7 +183,8 @@ def optimize_risk_parity(tickers, prices):
     ret, vol, sharpe = _perf(weights, mu, S)
 
     return {"method":"risk_parity","weights":weights,"expected_return":ret,"expected_vol":vol,
-            "sharpe_ratio":sharpe,"risk_contribution":{t:float(rc_arr[i]) for i,t in enumerate(tickers)},
+            "sharpe_ratio":sharpe,"success":res.success,
+            "risk_contribution":{t:float(rc_arr[i]) for i,t in enumerate(valid_tickers)},
             "mu":mu,"S":S}
 
 
