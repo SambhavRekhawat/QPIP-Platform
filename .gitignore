@@ -1,0 +1,36 @@
+# ── Secrets (NEVER upload these) ─────────────────────────────────────────────
+.env
+.env.*
+!.env.example
+
+# ── Python virtual environment ────────────────────────────────────────────────
+venv/
+.venv/
+*.egg-info/
+dist/
+build/
+.Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+
+# ── Logs & Exports ────────────────────────────────────────────────────────────
+logs/
+exports/
+
+# ── ML model binaries (too large for GitHub free tier) ───────────────────────
+ml_engine/saved_models/*.pkl
+
+# ── IDE ───────────────────────────────────────────────────────────────────────
+.vscode/
+.idea/
+*.swp
+
+# ── OS files ─────────────────────────────────────────────────────────────────
+.DS_Store
+Thumbs.db
+
+# ── NOTE: .streamlit/ is intentionally NOT ignored ───────────────────────────
+# config.toml inside it sets the dark theme for Streamlit Cloud.
+# data/ is also intentionally NOT ignored — exported results go to GitHub.
