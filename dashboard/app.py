@@ -41,9 +41,23 @@ from config import (
 _DATA_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "data")
 _MANIFEST_PATH = os.path.join(_DATA_DIR, "manifest.json")
 
+@st.cache_data(ttl=60)
 def _file_mode() -> bool:
-    """Return True if we should read from data/ files instead of PostgreSQL."""
-    return os.path.exists(_MANIFEST_PATH)
+    """
+    Return True only when PostgreSQL is NOT reachable.
+    Priority: live database > pre-computed files.
+    This ensures local runs always show live data even if data/ folder exists.
+    """
+    try:
+        from database.connection import get_db_engine
+        from sqlalchemy import text
+        engine = get_db_engine()
+        with engine.connect() as conn:
+            conn.execute(text("SELECT 1"))
+        return False   # DB is reachable → live mode
+    except Exception:
+        # DB unreachable (e.g. Streamlit Cloud) → use exported files
+        return os.path.exists(_MANIFEST_PATH)
 
 def _get_manifest() -> dict:
     """Load the export manifest (contains export date, ticker list, etc.)."""
@@ -2770,40 +2784,139 @@ def render_risk_attribution(data: Dict):
 
 # ─── Tab: Glossary ────────────────────────────────────────────────────────────
 
+def _load_universe_tickers() -> list:
+    """
+    Load the full list of trained tickers.
+    File mode  → reads from manifest.json (always available on Streamlit Cloud).
+    DB mode    → queries the prices table directly.
+    """
+    # ── File mode ──────────────────────────────────────────────────────────────
+    if _file_mode():
+        manifest = _get_manifest()
+        tickers  = manifest.get("tickers", [])
+        if tickers:
+            return sorted(tickers)
+
+    # ── Database mode ──────────────────────────────────────────────────────────
+    try:
+        from database.connection import get_db_engine
+        from sqlalchemy import text
+        engine = get_db_engine()
+        with engine.connect() as conn:
+            df = pd.read_sql(
+                text("SELECT DISTINCT ticker FROM prices "
+                     "WHERE ticker != '^NSEI' ORDER BY ticker"),
+                conn,
+            )
+        return df["ticker"].tolist()
+    except Exception:
+        return []
+
+
 def render_glossary():
-    st.subheader("📚 Metric Glossary")
-    st.markdown(
-        "Searchable reference for every metric in this platform. "
-        "Click any metric card in the dashboard for the same explanation inline."
-    )
-    st.divider()
+    inner = st.tabs(["📚 Metric Glossary", "🌐 Stock Universe"])
 
-    search = st.text_input("🔍 Search glossary…", placeholder="e.g. Sharpe, CAGR, momentum")
+    # ── Tab 1: Metric Glossary ─────────────────────────────────────────────────
+    with inner[0]:
+        st.subheader("📚 Metric Glossary")
+        st.markdown(
+            "Searchable reference for every metric in this platform. "
+            "Click any metric card in the dashboard for the same explanation inline."
+        )
+        st.divider()
 
-    tag_filter = st.radio(
-        "Filter by category",
-        ["All", "Performance", "Risk", "Factor", "ML/AI"],
-        horizontal=True,
-    )
-    tag_map = {"All": None, "Performance": "perf", "Risk": "risk",
-               "Factor": "factor", "ML/AI": "ml"}
-    selected_tag = tag_map[tag_filter]
+        search = st.text_input("🔍 Search glossary…",
+                               placeholder="e.g. Sharpe, CAGR, momentum",
+                               key="glossary_search")
 
-    shown = 0
-    for term, entry in GLOSSARY.items():
-        # Tag filter
-        if selected_tag and entry.get("tag") != selected_tag:
-            continue
-        # Search filter
-        if search:
-            s = search.lower()
-            if s not in term.lower() and s not in entry["short"].lower() and s not in entry["long"].lower():
+        tag_filter = st.radio(
+            "Filter by category",
+            ["All", "Performance", "Risk", "Factor", "ML/AI"],
+            horizontal=True,
+            key="glossary_tag",
+        )
+        tag_map = {"All": None, "Performance": "perf", "Risk": "risk",
+                   "Factor": "factor", "ML/AI": "ml"}
+        selected_tag = tag_map[tag_filter]
+
+        shown = 0
+        for term, entry in GLOSSARY.items():
+            if selected_tag and entry.get("tag") != selected_tag:
                 continue
-        glossary_card(term, entry)
-        shown += 1
+            if search:
+                s = search.lower()
+                if s not in term.lower() and s not in entry["short"].lower()                         and s not in entry["long"].lower():
+                    continue
+            glossary_card(term, entry)
+            shown += 1
 
-    if shown == 0:
-        st.info(f"No metrics match '{search}'. Try a shorter search term.")
+        if shown == 0:
+            st.info(f"No metrics match '{search}'. Try a shorter search term.")
+
+    # ── Tab 2: Stock Universe ──────────────────────────────────────────────────
+    with inner[1]:
+        st.subheader("🌐 Trained Stock Universe")
+        st.markdown(
+            "Every NSE ticker whose price history has been downloaded, "
+            "factor-scored, and used to train the ML models in this platform."
+        )
+
+        manifest  = _get_manifest()
+        exp_date  = manifest.get("export_date", "unknown")
+        n_display = manifest.get("n_tickers", "—")
+
+        c1, c2, c3 = st.columns(3)
+        c1.metric("Total tickers", n_display,
+                  help="Number of NSE stocks with price history in the database.")
+        c2.metric("Data as of", exp_date,
+                  help="Date the pipeline was last run and data exported.")
+        c3.metric("Benchmark", "NIFTY 50",
+                  help="All returns and signals are measured relative to NIFTY 50 (^NSEI).")
+
+        st.divider()
+
+        tickers = _load_universe_tickers()
+
+        if not tickers:
+            st.info("Ticker list not available. Run export_data.py and push data/ to GitHub.")
+        else:
+            # Search bar
+            search_t = st.text_input(
+                "🔍 Search tickers…",
+                placeholder="e.g. RELIANCE, HDFC, TATA",
+                key="universe_search",
+            )
+            filtered = [t for t in tickers
+                        if search_t.upper() in t] if search_t else tickers
+
+            st.caption(f"Showing {len(filtered)} of {len(tickers)} tickers")
+
+            # Display as a neat tag cloud / grid
+            # Split into rows of 8
+            cols_per_row = 8
+            rows = [filtered[i:i+cols_per_row]
+                    for i in range(0, len(filtered), cols_per_row)]
+
+            for row in rows:
+                cols = st.columns(cols_per_row)
+                for j, ticker in enumerate(row):
+                    cols[j].markdown(
+                        f'<span style="display:inline-block;background:#0E1A2E;'
+                        f'border:0.5px solid #1E3A5C;border-radius:4px;'
+                        f'padding:3px 8px;font-size:11px;font-family:monospace;'
+                        f'color:#00D4FF;margin:2px;">{ticker}</span>',
+                        unsafe_allow_html=True,
+                    )
+
+            st.divider()
+
+            # Also offer a plain comma-separated list for easy copy-paste
+            with st.expander("📋 Copy full list (comma-separated)"):
+                st.code(", ".join(tickers), language=None)
+                st.caption(
+                    "Paste this directly into the sidebar ticker input "
+                    "or into main.py --tickers to retrain on the full universe."
+                )
 
 
 # ─── Main App ─────────────────────────────────────────────────────────────────
