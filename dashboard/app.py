@@ -67,6 +67,21 @@ def _get_manifest() -> dict:
         return json.load(f)
 
 
+# ─── Optional RAG Copilot (LOCAL ONLY) ───────────────────────────────────────
+# The rag/ folder is gitignored, so this import succeeds only on a local machine
+# where the copilot is installed. On Streamlit Cloud it fails silently and the
+# Research Copilot tab simply does not appear.
+try:
+    import sys as _sys, os as _os
+    _root = _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__)))
+    if _root not in _sys.path:
+        _sys.path.insert(0, _root)
+    from rag.copilot_tab import render_copilot_tab
+    _RAG_AVAILABLE = True
+except Exception:
+    _RAG_AVAILABLE = False
+
+
 # ─── Page Config ─────────────────────────────────────────────────────────────
 st.set_page_config(
     page_title=DASHBOARD_TITLE,
@@ -2986,14 +3001,18 @@ def main():
     tickers = st.session_state["analysis_tickers"]
     method  = st.session_state["analysis_method"]
 
-    tabs = st.tabs([
+    _tab_labels = [
         "📈 Overview",    "🍩 Allocation",    "🔗 Correlation",
         "⚡ Factors",     "🎯 Signals",       "🧠 SHAP",
         "📰 Events",      "📉 Backtest",
         "📉 Quant Risk",  "🔬 Risk Attribution",
         "⚙️ Optimisation",
         "📚 Glossary",
-    ])
+    ]
+    # Append the RAG Copilot tab only when running locally with rag/ installed
+    if _RAG_AVAILABLE:
+        _tab_labels.append("🤖 Research Copilot")
+    tabs = st.tabs(_tab_labels)
 
     with tabs[0]:  render_overview(data)
     with tabs[1]:  render_allocation(data)
@@ -3011,6 +3030,13 @@ def main():
     with tabs[9]:  render_risk_attribution(data)
     with tabs[10]: render_optimization(data)
     with tabs[11]: render_glossary()
+    # Research Copilot is the last tab when available (index 12)
+    if _RAG_AVAILABLE:
+        with tabs[12]:
+            try:
+                render_copilot_tab(data)
+            except Exception as _e:
+                st.error(f"Research Copilot error: {_e}")
 
 
 if __name__ == "__main__":

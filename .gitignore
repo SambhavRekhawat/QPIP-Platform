@@ -31,6 +31,17 @@ ml_engine/saved_models/*.pkl
 .DS_Store
 Thumbs.db
 
+# ── RAG Equity Research Copilot (LOCAL ONLY — never deployed) ─────────────────
+# The entire RAG feature stays off GitHub: it needs Ollama + local models that
+# can't run on Streamlit Cloud. app.py imports it inside a try/except, so the
+# deployed dashboard simply hides the Research Copilot tab when rag/ is absent.
+rag/
+documents/
+chroma_store/
+chromadb/
+*.pdf
+*.docx
+
 # ── NOTE: .streamlit/ is intentionally NOT ignored ───────────────────────────
 # config.toml inside it sets the dark theme for Streamlit Cloud.
 # data/ is also intentionally NOT ignored — exported results go to GitHub.

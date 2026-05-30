@@ -99,11 +99,15 @@ def _newsapi_fetch(query: str, days_back: int = 7) -> List[Dict]:
 
     try:
         resp = requests.get(url, params=params, timeout=10)
-        if resp.status_code == 200:
-            return resp.json().get("articles", [])
-        logger.warning(f"NewsAPI HTTP {resp.status_code}")
+        data = resp.json()
+        if resp.status_code == 200 and data.get("status") == "ok":
+            arts = data.get("articles", [])
+            logger.info(f"  NewsAPI: {len(arts)} articles for query '{query[:40]}'")
+            return arts
+        # Surface the actual NewsAPI error so the cause is obvious
+        logger.warning(f"  NewsAPI error [{data.get('code')}]: {data.get('message')}")
     except Exception as e:
-        logger.warning(f"NewsAPI error: {e}")
+        logger.warning(f"  NewsAPI request failed: {e}")
     return []
 
 
@@ -144,8 +148,8 @@ NSE_RSS_FEEDS = [
 
 def fetch_ticker_news(ticker: str, days_back: int = 7) -> List[Dict]:
     """Fetch news for a specific NSE ticker."""
-    # If no API key, skip entirely — don't hang on RSS
-    if not NEWS_API_KEY or NEWS_API_KEY == "34113e24a41745d0acc9a71be7adbf4e":
+    # Skip only if NO key is configured at all
+    if not NEWS_API_KEY or NEWS_API_KEY in ("", "your_newsapi_key_here"):
         logger.debug(f"  Skipping news for {ticker} — no NewsAPI key configured")
         return []
     articles = _newsapi_fetch(
@@ -157,7 +161,7 @@ def fetch_ticker_news(ticker: str, days_back: int = 7) -> List[Dict]:
 
 def fetch_macro_news(days_back: int = 3) -> List[Dict]:
     """Fetch India macro / market news."""
-    if not NEWS_API_KEY or NEWS_API_KEY == "34113e24a41745d0acc9a71be7adbf4e":
+    if not NEWS_API_KEY or NEWS_API_KEY in ("", "your_newsapi_key_here"):
         logger.debug("  Skipping macro news — no NewsAPI key configured")
         return []
     articles = _newsapi_fetch(
