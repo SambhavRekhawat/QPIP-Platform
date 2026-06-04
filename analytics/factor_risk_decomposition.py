@@ -191,14 +191,15 @@ def factor_attribution_table(regression_result: Dict) -> pd.DataFrame:
             "Significant":         "✅" if abs(tstats[factor]) > 1.96 else "—",
         })
 
-    # Add alpha row
+    # Add alpha row — use None (not "—") for numeric columns so PyArrow
+    # doesn't see a mixed str/float column and crash with ArrowInvalid.
     rows.append({
         "Factor":              "Alpha (Unexplained)",
-        "Beta (Exposure)":     "—",
-        "t-stat":              "—",
+        "Beta (Exposure)":     None,   # no beta for the intercept
+        "t-stat":              None,
         "Return Contribution": f"{regression_result['alpha_annual']*100:.2f}%",
         "% of Portfolio Risk": f"{regression_result['residual_var']/max(sum(regression_result['risk_contribution'].values())+regression_result['residual_var'],1e-9)*100:.1f}%",
-        "Significant":         "—",
+        "Significant":         "n/a",
     })
 
     return pd.DataFrame(rows)

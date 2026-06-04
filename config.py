@@ -42,7 +42,7 @@ ALPHA_VANTAGE_KEY = os.getenv("ALPHA_VANTAGE_KEY", "")
 BENCHMARK_TICKER   = "^NSEI"           # NIFTY 50
 BENCHMARK_LABEL    = "NIFTY 50"
 NSE_SUFFIX         = ".NS"             # yfinance NSE suffix
-DATA_LOOKBACK_YEARS = 3
+DATA_LOOKBACK_YEARS = 5
 RISK_FREE_RATE      = 0.067            # India 10Y G-Sec approx
 TRADING_DAYS_YEAR   = 252
 

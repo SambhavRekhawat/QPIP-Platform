@@ -1002,6 +1002,43 @@ def render_sidebar():
     return tickers, method, custom_weights, data_years, run_backtest, run_btn
 
 
+def _arrow_safe(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Make a DataFrame safe to pass to st.dataframe() / PyArrow.
+
+    The '—' em-dash is used as a display placeholder for missing values
+    throughout the dashboard. PyArrow rejects it when it appears in a
+    column that also contains real numbers (mixed str/float = object dtype).
+
+    This function replaces '—' with None in every column that has numeric
+    values mixed with the placeholder, then coerces those columns to float.
+    Purely string columns (like 'Method', 'Scenario') are left untouched.
+    """
+    df = df.copy()
+    for col in df.columns:
+        if df[col].dtype == object:
+            # Check if any real numeric values exist in this column
+            has_numbers = df[col].apply(
+                lambda x: isinstance(x, (int, float)) or (
+                    isinstance(x, str) and x not in ("—", "", "✅", "⚠️", "❌")
+                    and _looks_numeric(x)
+                )
+            ).any()
+            if has_numbers:
+                df[col] = df[col].replace("—", None)
+                df[col] = pd.to_numeric(df[col], errors="coerce")
+    return df
+
+
+def _looks_numeric(s: str) -> bool:
+    """Return True if string looks like a number (int, float, %, ₹)."""
+    try:
+        float(s.replace("%", "").replace("₹", "").replace(",", "").strip())
+        return True
+    except (ValueError, AttributeError):
+        return False
+
+
 # ─── Tab: Overview ────────────────────────────────────────────────────────────
 
 def render_overview(data: Dict):
@@ -1394,34 +1431,234 @@ def render_shap(data: Dict):
 
 # ─── Tab: Events ──────────────────────────────────────────────────────────────
 
+def _load_raw_events(tickers: List[str], days_back: int = 7) -> pd.DataFrame:
+    """Load raw events with headlines from DB or data/ file."""
+    try:
+        from data_engine.events import load_recent_events
+        return load_recent_events(tickers, days_back=days_back)
+    except Exception:
+        return pd.DataFrame()
+
+
+def _sentiment_bar(score: float, width: int = 120) -> str:
+    """Render a mini HTML sentiment bar — green=positive, red=negative."""
+    pct   = min(100, max(0, int((score + 1) / 2 * 100)))   # map -1..+1 → 0..100%
+    color = SUCCESS_COLOR if score > 0.1 else (DANGER_COLOR if score < -0.1 else NEUTRAL_COLOR)
+    return (
+        f'<div style="display:inline-block;background:#1A2A3A;'
+        f'border-radius:99px;width:{width}px;height:8px;vertical-align:middle;">'
+        f'<div style="background:{color};width:{pct}%;height:8px;border-radius:99px;"></div>'
+        f'</div>'
+    )
+
+
+def _event_badge(event_type: str) -> str:
+    """Coloured badge for event classification."""
+    colours = {
+        "earnings":    ("#0D2B0D", "#00C853"),
+        "macro":       ("#1A1A2E", "#7C4DFF"),
+        "corp_action": ("#2B1A0D", "#FF6D00"),
+        "analyst":     ("#0D1A2B", "#00B0FF"),
+        "block_deal":  ("#2B0D1A", "#FF4081"),
+        "insider":     ("#2B2B0D", "#FFD600"),
+        "regulatory":  ("#2B0D0D", "#FF1744"),
+        "general":     ("#1A1A1A", "#607080"),
+    }
+    bg, fg = colours.get(event_type, colours["general"])
+    label = event_type.replace("_", " ").title()
+    return (
+        f'<span style="background:{bg};color:{fg};border:0.5px solid {fg};'
+        f'border-radius:4px;padding:1px 7px;font-size:10px;font-weight:600;'
+        f'white-space:nowrap;">{label}</span>'
+    )
+
+
 def render_events(data: Dict):
     section_intro(
         "Event Intelligence",
-        "News sentiment analysis for each ticker over the last 7 days.",
-        "Sentiment is computed using VADER + TextBlob NLP models on news headlines. "
+        "News sentiment, headline feed, and event classification for every ticker.",
+        "Sentiment is computed using VADER + TextBlob on news headlines. "
         "Score ranges from −1.0 (very negative) to +1.0 (very positive). "
-        "Enable a NewsAPI key in your .env file to activate this tab.",
+        "Events are classified automatically by keyword (earnings, macro, analyst, etc.). "
+        "Enable a NewsAPI key in your .env file to power this tab.",
     )
+
     sentiment_df = data.get("sentiment_df")
-    st.subheader("📰 Event Intelligence")
+    tickers      = list(data.get("weights", {}).keys())
 
     if sentiment_df is None or sentiment_df.empty:
-        st.info("No recent events loaded. Add a free NewsAPI key to your .env file to enable this tab.")
+        st.info(
+            "📭 No events loaded. Make sure NEWS_API_KEY is set in your .env file, "
+            "then re-run the analysis."
+        )
         return
 
-    for _, row in sentiment_df.iterrows():
-        score = row.get("avg_sentiment", 0)
-        label = row.get("dominant_sentiment", "Neutral")
-        color = SUCCESS_COLOR if score > 0.1 else (DANGER_COLOR if score < -0.1 else NEUTRAL_COLOR)
-        st.markdown(f"""
-        <div style="background:#0E1A2E;border-left:3px solid {color};
-                    border-radius:4px;padding:10px 14px;margin:6px 0;">
-            <span style="font-weight:700;color:#E0E8F0;">{row['ticker']}</span> &nbsp;|&nbsp;
-            <span style="color:{color};">{label}</span> &nbsp;|&nbsp;
-            <span style="color:#607080;">Score: {score:.3f}</span> &nbsp;|&nbsp;
-            <span style="color:#607080;">{int(row.get('event_count',0))} events</span>
-        </div>
-        """, unsafe_allow_html=True)
+    # ── Controls row ──────────────────────────────────────────────────────────
+    ctrl1, ctrl2, ctrl3 = st.columns([2, 1, 1])
+    with ctrl1:
+        selected_tickers = st.multiselect(
+            "Filter by ticker", tickers,
+            default=tickers[:min(5, len(tickers))],
+            key="events_ticker_filter",
+        )
+    with ctrl2:
+        days_back = st.selectbox(
+            "Lookback", [3, 7, 14, 30], index=1,
+            format_func=lambda x: f"{x} days",
+            key="events_days",
+        )
+    with ctrl3:
+        event_types = ["All", "earnings", "macro", "corp_action",
+                       "analyst", "block_deal", "regulatory", "general"]
+        type_filter = st.selectbox("Event type", event_types, key="events_type")
+
+    if not selected_tickers:
+        st.caption("Select at least one ticker above.")
+        return
+
+    # ── Summary sentiment cards ───────────────────────────────────────────────
+    st.subheader("📊 Sentiment Overview")
+    filt_sent = sentiment_df[sentiment_df["ticker"].isin(selected_tickers)]
+    if not filt_sent.empty:
+        cols = st.columns(min(len(filt_sent), 5))
+        for i, (_, row) in enumerate(filt_sent.head(5).iterrows()):
+            score  = float(row.get("avg_sentiment", 0))
+            label  = row.get("dominant_sentiment", "Neutral")
+            count  = int(row.get("event_count", 0))
+            color  = SUCCESS_COLOR if score > 0.1 else (DANGER_COLOR if score < -0.1 else NEUTRAL_COLOR)
+            icon   = "🟢" if score > 0.1 else ("🔴" if score < -0.1 else "🟡")
+            cols[i % 5].markdown(
+                f'<div style="background:#0A1628;border:0.5px solid {color};'
+                f'border-radius:8px;padding:10px 12px;text-align:center;">'
+                f'<div style="font-size:11px;color:#607080;margin-bottom:4px;">{row["ticker"]}</div>'
+                f'<div style="font-size:20px;">{icon}</div>'
+                f'<div style="font-size:13px;font-weight:600;color:{color};">{label}</div>'
+                f'<div style="font-size:11px;color:#607080;margin-top:3px;">'
+                f'Score {score:+.3f} · {count} events</div>'
+                f'{_sentiment_bar(score)}'
+                f'</div>',
+                unsafe_allow_html=True,
+            )
+
+    # ── Sentiment bar chart ───────────────────────────────────────────────────
+    if len(filt_sent) > 1:
+        st.divider()
+        fig_bar = go.Figure(go.Bar(
+            x=filt_sent["ticker"],
+            y=filt_sent["avg_sentiment"].round(3),
+            marker_color=[
+                SUCCESS_COLOR if v > 0.1 else (DANGER_COLOR if v < -0.1 else NEUTRAL_COLOR)
+                for v in filt_sent["avg_sentiment"]
+            ],
+            text=[f"{v:+.3f}" for v in filt_sent["avg_sentiment"]],
+            textposition="outside",
+        ))
+        fig_bar.add_hline(y=0.1,  line_dash="dot", line_color=SUCCESS_COLOR,
+                          annotation_text="Positive threshold",
+                          annotation_font_color=SUCCESS_COLOR)
+        fig_bar.add_hline(y=-0.1, line_dash="dot", line_color=DANGER_COLOR,
+                          annotation_text="Negative threshold",
+                          annotation_font_color=DANGER_COLOR)
+        fig_bar.update_layout(
+            **{k: v for k, v in PLOT_LAYOUT.items() if k not in ("legend", "yaxis")},
+            title="Average Sentiment Score by Ticker (last 7 days)",
+            yaxis=dict(range=[-1, 1], tickformat=".2f", zeroline=True,
+                       zerolinecolor="#1E2A3A"),
+            height=280, showlegend=False,
+        )
+        st.plotly_chart(fig_bar, width="stretch")
+
+    # ── Raw headlines feed ────────────────────────────────────────────────────
+    st.divider()
+    st.subheader("📰 Latest Headlines")
+
+    raw_events = _load_raw_events(selected_tickers, days_back=days_back)
+
+    if raw_events.empty:
+        st.caption("No headline data available — re-run the pipeline to fetch fresh news.")
+    else:
+        # Apply event-type filter
+        if type_filter != "All" and "event_type" in raw_events.columns:
+            raw_events = raw_events[raw_events["event_type"] == type_filter]
+
+        # Show up to 40 most recent headlines
+        show_df = raw_events.sort_values("event_date", ascending=False).head(40)
+
+        for _, row in show_df.iterrows():
+            headline  = row.get("headline", "")
+            score     = float(row.get("sentiment_score", 0))
+            label     = row.get("sentiment_label", "Neutral")
+            etype     = row.get("event_type", "general")
+            ticker    = row.get("ticker", "")
+            source    = row.get("source", "")
+            url       = row.get("url", "")
+            edate     = str(row.get("event_date", ""))[:10]
+            color     = SUCCESS_COLOR if score > 0.1 else (DANGER_COLOR if score < -0.1 else NEUTRAL_COLOR)
+            icon      = "▲" if score > 0.1 else ("▼" if score < -0.1 else "►")
+
+            headline_html = (
+                f'<a href="{url}" target="_blank" '
+                f'style="color:#C0D0E0;text-decoration:none;font-weight:500;">'
+                f'{headline}</a>'
+                if url else
+                f'<span style="color:#C0D0E0;font-weight:500;">{headline}</span>'
+            )
+
+            st.markdown(
+                f'<div style="background:#08111E;border:0.5px solid #1A2A3A;'
+                f'border-left:3px solid {color};border-radius:6px;'
+                f'padding:10px 14px;margin:5px 0;">'
+
+                # Top row: ticker badge + event type + date
+                f'<div style="display:flex;align-items:center;gap:8px;margin-bottom:6px;'
+                f'flex-wrap:wrap;">'
+                f'<span style="background:#0E1A2E;border:0.5px solid #2A3A5A;'
+                f'border-radius:4px;padding:1px 8px;font-size:11px;font-weight:700;'
+                f'color:#00D4FF;">{ticker}</span>'
+                f'{_event_badge(etype)}'
+                f'<span style="color:#607080;font-size:11px;margin-left:auto;">'
+                f'{edate} · {source}</span>'
+                f'</div>'
+
+                # Headline
+                f'<div style="font-size:13px;margin-bottom:7px;line-height:1.5;">'
+                f'{headline_html}</div>'
+
+                # Bottom row: sentiment bar + score + label
+                f'<div style="display:flex;align-items:center;gap:10px;">'
+                f'{_sentiment_bar(score, width=80)}'
+                f'<span style="color:{color};font-size:12px;font-weight:600;">'
+                f'{icon} {label}</span>'
+                f'<span style="color:#607080;font-size:11px;">score {score:+.3f}</span>'
+                f'</div>'
+
+                f'</div>',
+                unsafe_allow_html=True,
+            )
+
+        if len(raw_events) > 40:
+            st.caption(f"Showing 40 of {len(raw_events)} events. "
+                       f"Use the ticker and type filters above to narrow down.")
+
+    # ── Event type breakdown ──────────────────────────────────────────────────
+    if not raw_events.empty and "event_type" in raw_events.columns:
+        st.divider()
+        st.subheader("🏷️ Event Type Breakdown")
+        type_counts = raw_events["event_type"].value_counts().reset_index()
+        type_counts.columns = ["Event Type", "Count"]
+        fig_types = go.Figure(go.Bar(
+            x=type_counts["Event Type"],
+            y=type_counts["Count"],
+            marker_color=BRAND_COLOR,
+            text=type_counts["Count"],
+            textposition="outside",
+        ))
+        fig_types.update_layout(
+            **{k: v for k, v in PLOT_LAYOUT.items() if k != "legend"},
+            title="Events by Category",
+            height=240, showlegend=False,
+        )
+        st.plotly_chart(fig_types, width="stretch")
 
 
 # ─── Tab: Backtest ────────────────────────────────────────────────────────────
@@ -1549,7 +1786,7 @@ def render_risk_metrics(data: Dict):
         "Hit Ratio":          get_help_text("Hit Ratio"),
     }
     st.dataframe(
-        comp_df,
+        _arrow_safe(comp_df),
         width='stretch',
         hide_index=True,
         column_config={
@@ -2364,7 +2601,7 @@ def render_factor_risk(data: Dict):
         # Attribution table
         st.markdown("#### Factor Attribution Table")
         attr_df = factor_attribution_table(reg_result)
-        st.dataframe(attr_df, width="stretch", hide_index=True)
+        st.dataframe(_arrow_safe(attr_df), width="stretch", hide_index=True)
 
         # Risk contribution pie
         risk_pct = reg_result.get("risk_pct", {})
